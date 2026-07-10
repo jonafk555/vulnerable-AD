@@ -1,48 +1,51 @@
 <#
 .SYNOPSIS
-    VulnAD-Extended — 升級版 Vulnerable Active Directory 建置腳本
+    VulnAD-Extended - Enhanced Vulnerable Active Directory Lab Builder
 
 .DESCRIPTION
-    在原 VulnAD (by wazehell/@safe_buffer) 的基礎上大幅擴增，涵蓋以下訓練主題：
+    An enhanced fork of the original VulnAD (by wazehell/@safe_buffer) that
+    provisions a comprehensive vulnerable Active Directory environment for
+    red-team training. Covers the following attack surfaces:
 
-    基礎（保留自原版）：
-      - Password Spraying / Default Password / Description Password
+    Baseline (retained from original):
+      - Password Spraying / Default Password / Cleartext in Description
       - AS-REP Roasting / Kerberoasting
-      - DnsAdmins Abuse / DCSync 授權
-      - Bad ACL 多層交叉授權
-      - SMB Signing 停用
+      - DnsAdmins Abuse / DCSync rights delegation
+      - Multi-tier BadACL cross-authorization
+      - SMB signing disabled
 
-    委派攻擊：
-      - Unconstrained Delegation（機器帳戶）
+    Kerberos Delegation:
+      - Unconstrained Delegation (computer account)
       - Constrained Delegation - Kerberos Only
       - Constrained Delegation - Protocol Transition (Any Auth)
-      - RBCD 條件（保留 MachineAccountQuota=10）
+      - RBCD preconditions (MachineAccountQuota preserved at 10)
 
-    憑證攻擊：
-      - Shadow Credentials 前置條件（授予 GenericWrite）
-      - AD CS ESC1 / ESC4 / ESC7（若 AD CS 已安裝則設定）
-      - Certificate Chain（授予 CA ACL）
+    Certificate Attacks:
+      - Shadow Credentials preconditions (GenericWrite/All grant)
+      - AD CS ESC hints (guided setup if role installed)
+      - Certificate chain ACL grants
 
-    現代化服務帳戶：
-      - gMSA + 過度授權（Domain Computers 可讀密碼）
-      - dMSA CreateChild 權限（僅 Server 2025 DC 上有效）
+    Modern Service Accounts:
+      - gMSA with excessive permissions (Domain Computers can read secret)
+      - dMSA CreateChild rights (Windows Server 2025 only)
 
-    LAPS：
-      - Legacy LAPS Schema 擴充（若可用）
-      - LAPS 密碼讀取權限過度授權
+    LAPS:
+      - Legacy LAPS schema detection
+      - Over-privileged LAPS password read access
 
-    Legacy / 弱設定：
-      - pre2k 機器帳戶（密碼可預測）
-      - Reversible Encryption 啟用帳戶
-      - GPP cpassword 檔案在 SYSVOL
+    Legacy / Weak Settings:
+      - Pre-Windows 2000 computer account (predictable password)
+      - Reversible Encryption enabled accounts
+      - GPP cpassword file planted in SYSVOL
 
-    強制認證前置：
-      - Print Spooler 服務啟用（PrinterBug 條件）
-      - WebClient 服務啟用（WebDAV Coercion 條件）
+    Coercion Preconditions:
+      - Print Spooler service enabled (PrinterBug)
+      - EFS service enabled (PetitPotam)
+      - DFS Namespace service enabled (DFSCoerce)
 
-    持久化前置：
-      - AdminSDHolder ACL 後門
-      - 多層 ACL 巢狀（A→B→C→Domain Admins）
+    Persistence Preconditions:
+      - AdminSDHolder ACL backdoor
+      - Multi-hop ACL chain (A -> B -> C -> Domain Admins)
 
 .EXAMPLE
     Invoke-VulnADExtended -DomainName "redteamlab.local" -UsersLimit 100
@@ -51,12 +54,13 @@
     Invoke-VulnADExtended -DomainName "redteamlab.local" -SkipADCS -SkipDelegation
 
 .NOTES
-    Author: Extended based on wazehell/@safe_buffer's VulnAD
-    僅供合法授權的紅隊訓練與靶場建置使用。
+    Author: Extended fork of wazehell/@safe_buffer's VulnAD
+    For authorized red-team training and isolated lab environments only.
+    NEVER run this on any production network.
 #>
 
 # ============================================================
-# Global 資料清單
+# Global data lists
 # ============================================================
 
 $Global:HumansNames = @(
@@ -124,7 +128,7 @@ $Global:NormalGroups = @('Marketing','Sales','Accounting','Support','Research')
 
 $Global:BadACL = @('GenericAll','GenericWrite','WriteOwner','WriteDACL','Self','WriteProperty')
 
-# 服務帳戶 SPN 對照（會建立為 User 帳戶而非 gMSA，以便 Kerberoasting）
+# Service accounts with SPNs - created as regular users so Kerberoasting works
 $Global:ServicesAccountsAndSPNs = @(
     @{Name='svc_mssql';   SPN='MSSQLSvc/sqlserver';     Weak=$true;  Desc='SQL Database Service'},
     @{Name='svc_http';    SPN='HTTP/webserver';         Weak=$false; Desc='Web Application Service'},
@@ -140,7 +144,7 @@ $Global:DomainDN      = ''
 $Global:DomainSid     = ''
 
 # ============================================================
-# 輔助輸出
+# Output helpers
 # ============================================================
 
 $Global:Spacing   = "`t"
@@ -157,11 +161,11 @@ function Write-Warn { param($String) Write-Host $Global:WarnLine $String -Foregr
 function ShowBanner {
     $banner = @(
         '',
-        '  ╔═══════════════════════════════════════════════════════════╗',
-        '  ║   VulnAD-Extended — Vulnerable Active Directory (v2.0)   ║',
-        '  ║   Original by wazehell/@safe_buffer, Extended edition    ║',
-        '  ║   For authorized red-team lab environments only          ║',
-        '  ╚═══════════════════════════════════════════════════════════╝',
+        '  ============================================================',
+        '     VulnAD-Extended - Vulnerable Active Directory (v2.0)',
+        '     Original by wazehell/@safe_buffer, Extended edition',
+        '     For authorized red-team lab environments only',
+        '  ============================================================',
         ''
     )
     $banner | ForEach-Object {
@@ -170,7 +174,7 @@ function ShowBanner {
 }
 
 # ============================================================
-# 通用工具函數
+# Common utility functions
 # ============================================================
 
 function VulnAD-GetRandom {
@@ -181,18 +185,18 @@ function VulnAD-GetRandom {
 function VulnAD-CheckPrerequisites {
     Write-Info 'Checking prerequisites...'
 
-    # 檢查 RSAT / AD Module
+    # Check for RSAT / AD PowerShell module
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-        Write-Bad 'ActiveDirectory PowerShell module not found. Install RSAT-AD-PowerShell.'
+        Write-Bad 'ActiveDirectory PowerShell module not found. Install RSAT-AD-PowerShell first.'
         return $false
     }
     Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 
-    # 是否為 DC
+    # Verify AD is reachable
     try {
         $null = Get-ADDomain -ErrorAction Stop
     } catch {
-        Write-Bad 'Cannot query AD. This script must run on a Domain Controller or a domain-joined machine with RSAT.'
+        Write-Bad 'Cannot query Active Directory. Run this script on a Domain Controller or a domain-joined host with RSAT installed.'
         return $false
     }
 
@@ -246,7 +250,7 @@ function VulnAD-AddACL {
 }
 
 # ============================================================
-# 基礎函數（保留自原版）
+# Baseline functions (retained from original VulnAD)
 # ============================================================
 
 function VulnAD-AddADUser {
@@ -258,7 +262,7 @@ function VulnAD-AddADUser {
         $lastname  = VulnAD-GetRandom -InputList $Global:HumansNames
         $SamAccountName = ("{0}.{1}" -f $firstname, $lastname).ToLower()
 
-        # 避免重複
+        # Skip duplicates
         if ($Global:CreatedUsers -contains $SamAccountName) { continue }
 
         $upn = "$SamAccountName@$Global:Domain"
@@ -284,7 +288,7 @@ function VulnAD-AddADGroup {
     foreach ($group in $GroupList) {
         Write-Info "Creating group: $group"
         try { New-ADGroup -Name $group -GroupScope Global -ErrorAction Stop } catch {}
-        # 隨機加入 3-15 個成員
+        # Randomly add 3-15 members
         $memberCount = Get-Random -Minimum 3 -Maximum 16
         for ($i = 1; $i -le $memberCount; $i++) {
             $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
@@ -297,7 +301,7 @@ function VulnAD-AddADGroup {
 function VulnAD-BadAcls {
     Write-Info 'Building multi-tier BadACL attack paths...'
 
-    # 階梯 1：NormalGroup → MidGroup（供 BloodHound 練習）
+    # Tier 1: NormalGroup -> MidGroup (perfect for BloodHound exercises)
     foreach ($abuse in $Global:BadACL) {
         $ngroup = VulnAD-GetRandom -InputList $Global:NormalGroups
         $mgroup = VulnAD-GetRandom -InputList $Global:MidGroups
@@ -310,7 +314,7 @@ function VulnAD-BadAcls {
         } catch {}
     }
 
-    # 階梯 2：MidGroup → HighGroup
+    # Tier 2: MidGroup -> HighGroup
     foreach ($abuse in $Global:BadACL) {
         $mgroup = VulnAD-GetRandom -InputList $Global:MidGroups
         $hgroup = VulnAD-GetRandom -InputList $Global:HighGroups
@@ -323,7 +327,7 @@ function VulnAD-BadAcls {
         } catch {}
     }
 
-    # 隨機混合 ACE
+    # Random mixed ACEs
     $mixed = Get-Random -Minimum 15 -Maximum 26
     for ($i = 1; $i -le $mixed; $i++) {
         $abuse = VulnAD-GetRandom -InputList $Global:BadACL
@@ -346,7 +350,7 @@ function VulnAD-Kerberoasting {
     Write-Info 'Configuring Kerberoastable service accounts...'
     Add-Type -AssemblyName System.Web
 
-    # 從清單中隨機挑一個「弱密碼」帳戶
+    # Randomly pick one weak-password account from the list
     $weakOne = ($Global:ServicesAccountsAndSPNs | Where-Object { $_.Weak })[0]
 
     foreach ($svc in $Global:ServicesAccountsAndSPNs) {
@@ -354,10 +358,10 @@ function VulnAD-Kerberoasting {
 
         if ($svc.Name -eq $weakOne.Name) {
             $pwd = VulnAD-GetRandom -InputList $Global:BadPasswords
-            Write-Warn "  [WEAK] $($svc.Name) with SPN=$spn — password from BadPasswords list"
+            Write-Warn "  [WEAK] $($svc.Name) with SPN=$spn - password from BadPasswords list"
         } else {
             $pwd = [System.Web.Security.Membership]::GeneratePassword(24, 5)
-            Write-Info "  [SAFE] $($svc.Name) with SPN=$spn — random 24-char password"
+            Write-Info "  [SAFE] $($svc.Name) with SPN=$spn - random 24-char password"
         }
 
         try {
@@ -372,7 +376,7 @@ function VulnAD-Kerberoasting {
                 -ErrorAction Stop
             $Global:CreatedUsers += $svc.Name
         } catch {
-            # 已存在則補設定
+            # If already exists, just append the SPN
             try {
                 Set-ADUser -Identity $svc.Name -ServicePrincipalNames @{Add=$spn} -ErrorAction SilentlyContinue
             } catch {}
@@ -389,7 +393,7 @@ function VulnAD-ASREPRoasting {
         try {
             Set-ADAccountPassword -Identity $u -Reset -NewPassword (ConvertTo-SecureString $pwd -AsPlainText -Force)
             Set-ADAccountControl -Identity $u -DoesNotRequirePreAuth $true
-            Write-Info "  [ASREP] $u — DoesNotRequirePreAuth + weak password"
+            Write-Info "  [ASREP] $u - DoesNotRequirePreAuth + weak password"
         } catch {}
     }
 }
@@ -404,7 +408,7 @@ function VulnAD-DnsAdmins {
             Write-Info "  [DnsAdmins] $u"
         } catch {}
     }
-    # 巢狀：讓中權限群組成為 DnsAdmins 的間接成員
+    # Nested group: mid-tier group becomes an indirect DnsAdmins member
     $g = VulnAD-GetRandom -InputList $Global:MidGroups
     try {
         Add-ADGroupMember -Identity 'DnsAdmins' -Members $g -ErrorAction SilentlyContinue
@@ -421,7 +425,7 @@ function VulnAD-PwdInObjectDescription {
         $pwd = [System.Web.Security.Membership]::GeneratePassword(12, 2)
         try {
             Set-ADAccountPassword -Identity $u -Reset -NewPassword (ConvertTo-SecureString $pwd -AsPlainText -Force)
-            # 用不同關鍵字型式，模擬真實情境
+            # Use varied phrasing to mimic real-world sloppy admin comments
             $templates = @(
                 "User Password $pwd",
                 "temp pw: $pwd (do not delete)",
@@ -459,7 +463,7 @@ function VulnAD-PasswordSpraying {
             Set-ADAccountPassword -Identity $u -Reset `
                 -NewPassword (ConvertTo-SecureString $shared -AsPlainText -Force)
             Set-ADUser $u -Description 'Standard user account'
-            Write-Info "  [PasswordSpray] $u ← $shared"
+            Write-Info "  [PasswordSpray] $u <- $shared"
         } catch {}
     }
 }
@@ -484,7 +488,7 @@ function VulnAD-DCSync {
             }
             $ADObject.psbase.CommitChanges()
             Set-ADUser $u -Description 'Replication Account'
-            Write-Info "  [DCSync] $u — granted 3 replication extended rights"
+            Write-Info "  [DCSync] $u - granted 3 replication extended rights"
         } catch {}
     }
 }
@@ -499,17 +503,18 @@ function VulnAD-DisableSMBSigning {
 }
 
 # ============================================================
-# 擴增函數 — 委派攻擊
+# Extended functions - Kerberos Delegation
 # ============================================================
 
 function VulnAD-UnconstrainedDelegation {
     <#
-        對應 Lab：Unconstrained Delegation + Printer Bug (Vol1 Lab4-5, Course Part1 Lab4-5)
-        設定隨機一台成員伺服器（或建立虛擬電腦帳戶）為 TrustedForDelegation
+        Related labs: Unconstrained Delegation + Printer Bug
+        Sets TrustedForDelegation on a random member server (or creates
+        a placeholder computer account if none exist).
     #>
     Write-Info 'Configuring Unconstrained Delegation on a member server...'
 
-    # 尋找非 DC 的電腦帳戶
+    # Look for non-DC computer accounts
     $candidates = Get-ADComputer -Filter { PrimaryGroupID -ne 516 } -Properties DNSHostName |
                   Where-Object { $_.Enabled }
 
@@ -522,7 +527,7 @@ function VulnAD-UnconstrainedDelegation {
             Write-Bad "  Failed to set on $($target.Name)"
         }
     } else {
-        # 沒有成員伺服器 → 建立一個假的電腦帳戶模擬
+        # No member servers - create a placeholder computer account
         try {
             New-ADComputer -Name 'SRV-LEGACY' -SamAccountName 'SRV-LEGACY$' `
                 -Path "CN=Computers,$Global:DomainDN" `
@@ -538,15 +543,15 @@ function VulnAD-UnconstrainedDelegation {
 
 function VulnAD-ConstrainedDelegation {
     <#
-        對應 Lab：Constrained Delegation (Kerberos Only & Any Auth)
-        - svc_iis 設定為 Any Auth（Protocol Transition + Constrained）
-        - svc_web 設定為 Kerberos Only
+        Related labs: Constrained Delegation (Kerberos Only and Any Auth)
+        - svc_iis: Protocol Transition + Constrained (Any Auth)
+        - svc_web: Constrained Kerberos Only + weak password (Kerberoastable)
     #>
     Write-Info 'Configuring Constrained Delegation service accounts...'
 
     Add-Type -AssemblyName System.Web
 
-    # Any Auth（Protocol Transition）
+    # Any Auth (Protocol Transition)
     try {
         $pwd = [System.Web.Security.Membership]::GeneratePassword(20, 4)
         New-ADUser -Name 'svc_iis' -SamAccountName 'svc_iis' `
@@ -561,14 +566,14 @@ function VulnAD-ConstrainedDelegation {
         Set-ADUser 'svc_iis' -Add @{ 'msDS-AllowedToDelegateTo' = @($target) }
         Set-ADAccountControl -Identity 'svc_iis' -TrustedToAuthForDelegation $true
         $Global:CreatedUsers += 'svc_iis'
-        Write-Info "  [Constrained-AnyAuth] svc_iis → $target"
+        Write-Info "  [Constrained-AnyAuth] svc_iis -> $target"
     } catch {
         Write-Bad "  svc_iis: $($_.Exception.Message)"
     }
 
     # Kerberos Only
     try {
-        $pwd = VulnAD-GetRandom -InputList $Global:BadPasswords  # 弱密碼，方便 Kerberoasting
+        $pwd = VulnAD-GetRandom -InputList $Global:BadPasswords  # weak so it's Kerberoastable
         New-ADUser -Name 'svc_web' -SamAccountName 'svc_web' `
             -UserPrincipalName "svc_web@$Global:Domain" `
             -AccountPassword (ConvertTo-SecureString $pwd -AsPlainText -Force) `
@@ -579,9 +584,9 @@ function VulnAD-ConstrainedDelegation {
 
         $target = "CIFS/$(($env:COMPUTERNAME)).$Global:Domain"
         Set-ADUser 'svc_web' -Add @{ 'msDS-AllowedToDelegateTo' = @($target) }
-        # 不設定 TrustedToAuthForDelegation = Kerberos Only
+        # No TrustedToAuthForDelegation flag = Kerberos Only
         $Global:CreatedUsers += 'svc_web'
-        Write-Info "  [Constrained-KerberosOnly] svc_web → $target (weak password)"
+        Write-Info "  [Constrained-KerberosOnly] svc_web -> $target (weak password)"
     } catch {
         Write-Bad "  svc_web: $($_.Exception.Message)"
     }
@@ -589,13 +594,13 @@ function VulnAD-ConstrainedDelegation {
 
 function VulnAD-RBCDPrep {
     <#
-        對應 Lab：RBCD
-        1. 保留預設 MachineAccountQuota=10（讓低權限也能建立機器帳戶）
-        2. 授予某使用者對電腦物件的 GenericWrite（RBCD 攻擊入口）
+        Related labs: RBCD
+        1. Preserve default MachineAccountQuota = 10 (low-priv users can create computer accounts)
+        2. Grant GenericWrite on computer objects to random users (RBCD entry point)
     #>
     Write-Info 'Preparing RBCD attack surface...'
 
-    # 確認 MachineAccountQuota
+    # Verify MachineAccountQuota
     try {
         $quota = (Get-ADObject -Identity $Global:DomainDN -Properties 'ms-DS-MachineAccountQuota').'ms-DS-MachineAccountQuota'
         if ($null -eq $quota -or $quota -eq 0) {
@@ -608,7 +613,7 @@ function VulnAD-RBCDPrep {
         Write-Bad "  Cannot set MAQ: $($_.Exception.Message)"
     }
 
-    # 對每一台成員電腦，隨機挑一個使用者授予 GenericWrite
+    # Grant GenericWrite on up to 5 computer objects to random users
     try {
         $computers = Get-ADComputer -Filter { PrimaryGroupID -ne 516 } | Select-Object -First 5
         foreach ($c in $computers) {
@@ -623,9 +628,9 @@ function VulnAD-RBCDPrep {
 
 function VulnAD-ShadowCredentialsPrep {
     <#
-        對應 Lab：Shadow Credentials (第二冊題7 + 第四冊 RB1)
-        授予某使用者對目標電腦的 GenericWrite（可寫入 msDS-KeyCredentialLink）
-        與 RBCD 前置條件重疊 — 但顯性標註為 Shadow Credentials 目標
+        Related labs: Shadow Credentials
+        Grant GenericAll on target computers so the attacker can write to
+        msDS-KeyCredentialLink.
     #>
     Write-Info 'Preparing Shadow Credentials attack surface...'
     try {
@@ -633,7 +638,7 @@ function VulnAD-ShadowCredentialsPrep {
         foreach ($c in $computers) {
             $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
             $Src = Get-ADUser -Identity $u
-            # GenericAll 可以寫入所有屬性包括 msDS-KeyCredentialLink
+            # GenericAll covers writing msDS-KeyCredentialLink
             if (VulnAD-AddACL -Source $Src.SID -Destination $c.DistinguishedName -Rights 'GenericAll') {
                 Write-Info "  [ShadowCred-Entry] $u has GenericAll over $($c.Name)"
             }
@@ -642,16 +647,17 @@ function VulnAD-ShadowCredentialsPrep {
 }
 
 # ============================================================
-# 擴增函數 — AD CS ESC 系列
+# Extended functions - AD CS (ESC series)
 # ============================================================
 
 function VulnAD-ADCSVulnerable {
     <#
-        對應 Lab：AD CS ESC1 / ESC4 / ESC7 (第二冊題16-17, 第四冊 CS1-CS7)
-        僅在 AD CS 已安裝時執行
+        Related labs: AD CS ESC1 / ESC4 / ESC7
+        Only runs meaningful actions if AD CS is already installed.
+        Otherwise prints hints for manual setup.
     #>
     if (-not (VulnAD-IsADCSInstalled)) {
-        Write-Warn 'AD CS not installed — skipping ADCS vulnerabilities'
+        Write-Warn 'AD CS not installed - skipping ADCS vulnerabilities'
         Write-Warn '  Install with: Install-WindowsFeature AD-Certificate -IncludeManagementTools'
         Write-Warn '  Then: Install-AdcsCertificationAuthority -CAType EnterpriseRootCa'
         return
@@ -660,25 +666,23 @@ function VulnAD-ADCSVulnerable {
     Write-Info 'Configuring vulnerable AD CS templates...'
 
     try {
-        # ESC1 條件：Client Authentication EKU + Enrollee Supplies Subject + 低權限可 Enroll
-        # 由於 template 屬性複雜，這裡建立標記讓學員知道要手動或用 certipy 檢查
-        Write-Info '  [ESC-Hint] Manually check with: certipy find -u <user>@<domain> -p <pass> -vulnerable'
+        # ESC1 requires: Client Authentication EKU + Enrollee Supplies Subject +
+        # Domain Users can Enroll. Template ACL manipulation is complex; leave
+        # hints for manual/certipy-based validation.
+        Write-Info '  [ESC-Hint] Verify with: certipy find -u <user>@<domain> -p <pass> -vulnerable'
         Write-Info '  Or on DC: certutil -catemplates'
 
-        # ESC7：授予非管理員對 CA 的 ManageCA / ManageCertificates
-        # 需要透過 certutil 或 DCOM 方式，這裡透過 Registry 標記
+        # ESC7: grant a non-admin ManageCA or ManageCertificates on the CA
         $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
         try {
             $ca = Get-CertificationAuthority -ErrorAction SilentlyContinue |
                   Where-Object { $_.IsRoot } | Select-Object -First 1
             if ($ca) {
-                # 使用 certutil 授權（需要 PSPKI 或手動）
-                Write-Warn "  [ESC7-Hint] Grant ManageCA/ManageCertificates to $u manually:"
-                Write-Warn "    certutil -setreg 'CA\Security' — See PSPKI module for automation"
+                Write-Warn "  [ESC7-Hint] Manually grant ManageCA/ManageCertificates to $u"
+                Write-Warn "    certutil -setreg 'CA\Security' - or use the PSPKI module"
             }
         } catch {}
 
-        # 建立一個易受攻擊的模板名稱標記
         Write-Info '  [ADCS] Suggested manual step: duplicate "User" template as "VulnUser"'
         Write-Info '    Enable "Supply in the request" + Client Auth EKU + Domain Users can Enroll'
     } catch {
@@ -687,17 +691,16 @@ function VulnAD-ADCSVulnerable {
 }
 
 # ============================================================
-# 擴增函數 — gMSA / dMSA
+# Extended functions - gMSA / dMSA
 # ============================================================
 
 function VulnAD-VulnerableGMSA {
     <#
-        對應 Lab：gMSA (SCCM/DCOM/gMSA 專項 G1-G4)
-        建立 gMSA 並過度授權（Domain Computers 可讀取密碼）
+        Related labs: gMSA overprivilege (Domain Computers can read secret)
     #>
     Write-Info 'Creating gMSA with excessive permissions...'
 
-    # 檢查 KDS Root Key
+    # Check KDS Root Key
     $kds = Get-KdsRootKey -ErrorAction SilentlyContinue
     if (-not $kds) {
         try {
@@ -709,7 +712,7 @@ function VulnAD-VulnerableGMSA {
         }
     }
 
-    # gMSA 1：過度授權（Domain Computers 可讀取 → 任何入侵的機器都能取得密碼）
+    # gMSA 1: over-privileged - any compromised computer can read the password
     try {
         $existing = Get-ADServiceAccount -Filter { Name -eq 'gmsa_overshare' } -ErrorAction SilentlyContinue
         if (-not $existing) {
@@ -718,7 +721,7 @@ function VulnAD-VulnerableGMSA {
                 -PrincipalsAllowedToRetrieveManagedPassword 'Domain Computers' `
                 -ServicePrincipalNames @("MSSQLSvc/gmsa-sql.$Global:Domain:1433") `
                 -ErrorAction Stop
-            Write-Warn '  [gMSA-OverPriv] gmsa_overshare — readable by ALL domain computers'
+            Write-Warn '  [gMSA-OverPriv] gmsa_overshare - readable by ALL domain computers'
         } else {
             Write-Info '  gmsa_overshare already exists'
         }
@@ -726,18 +729,18 @@ function VulnAD-VulnerableGMSA {
         Write-Bad "  gmsa_overshare: $($_.Exception.Message)"
     }
 
-    # gMSA 2：正確授權（對照組）
+    # gMSA 2: securely scoped (control group)
     try {
         $existing = Get-ADServiceAccount -Filter { Name -eq 'gmsa_secure' } -ErrorAction SilentlyContinue
         if (-not $existing) {
-            # 挑一台成員伺服器（若無則用 DC 自己作為佔位）
+            # Pick a member server, or fall back to a DC as placeholder
             $target = (Get-ADComputer -Filter { PrimaryGroupID -ne 516 } | Select-Object -First 1)
             if (-not $target) { $target = Get-ADComputer -Filter { PrimaryGroupID -eq 516 } | Select-Object -First 1 }
             New-ADServiceAccount -Name 'gmsa_secure' `
                 -DNSHostName "gmsa_secure.$Global:Domain" `
                 -PrincipalsAllowedToRetrieveManagedPassword "$($target.SamAccountName)" `
                 -ErrorAction Stop
-            Write-Info "  [gMSA-Secure] gmsa_secure — only $($target.Name) can read"
+            Write-Info "  [gMSA-Secure] gmsa_secure - only $($target.Name) can read"
         }
     } catch {
         Write-Bad "  gmsa_secure: $($_.Exception.Message)"
@@ -746,18 +749,18 @@ function VulnAD-VulnerableGMSA {
 
 function VulnAD-DMSAPrep {
     <#
-        對應 Lab：BadSuccessor (第六冊 Lab1, 2026現代技術冊 Lab1)
-        僅在 Windows Server 2025 上有效
+        Related labs: BadSuccessor (dMSA abuse)
+        Only meaningful on Windows Server 2025 (build 26100+).
     #>
     if (-not (VulnAD-IsServer2025)) {
-        Write-Warn 'This host is not Server 2025 — dMSA/BadSuccessor conditions cannot be created'
+        Write-Warn 'This host is not Server 2025 - dMSA/BadSuccessor conditions cannot be created'
         return
     }
 
     Write-Info 'Preparing dMSA/BadSuccessor conditions (Server 2025)...'
 
     try {
-        # 建立一個 OU 讓非管理員可以在其中建立 dMSA
+        # Create an OU where non-admins can create dMSAs
         $ouPath = "OU=ServiceAccountsOU,$Global:DomainDN"
         $ouExists = Get-ADOrganizationalUnit -Filter { DistinguishedName -eq $ouPath } -ErrorAction SilentlyContinue
         if (-not $ouExists) {
@@ -765,7 +768,7 @@ function VulnAD-DMSAPrep {
                 -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
         }
 
-        # 授予一個中權限群組對該 OU 的 CreateChild（針對 msDS-DelegatedManagedServiceAccount）
+        # Grant a mid-tier group CreateChild for msDS-DelegatedManagedServiceAccount
         $mgroup = VulnAD-GetRandom -InputList $Global:MidGroups
         $Src = Get-ADGroup -Identity $mgroup
 
@@ -783,41 +786,40 @@ function VulnAD-DMSAPrep {
         $ou.psbase.CommitChanges()
 
         Write-Warn "  [BadSuccessor] $mgroup can now CreateChild dMSA in $ouPath"
-        Write-Warn '  Any member of this group can perform BadSuccessor attack'
+        Write-Warn '  Any member of this group can perform BadSuccessor'
     } catch {
         Write-Bad "  dMSA prep failed: $($_.Exception.Message)"
     }
 }
 
 # ============================================================
-# 擴增函數 — LAPS
+# Extended functions - LAPS
 # ============================================================
 
 function VulnAD-VulnerableLAPS {
     <#
-        對應 Lab：LAPS (Vol1 Lab10, Course Part1 Lab10)
-        1. 檢查 LAPS Schema 是否已擴充
-        2. 授予中權限群組讀取 LAPS 密碼
+        Related labs: LAPS abuse
+        1. Detect Legacy LAPS schema (ms-Mcs-AdmPwd)
+        2. Grant a mid-tier group excessive read access to LAPS passwords
     #>
     Write-Info 'Configuring LAPS with over-privileged read access...'
 
-    # 檢查 Legacy LAPS Schema（ms-Mcs-AdmPwd）
+    # Legacy LAPS schema (ms-Mcs-AdmPwd)
     $legacyLaps = Get-ADObject -Filter { Name -eq 'ms-Mcs-AdmPwd' } `
         -SearchBase "CN=Schema,CN=Configuration,$Global:DomainDN" -ErrorAction SilentlyContinue
 
     if (-not $legacyLaps) {
-        Write-Warn '  Legacy LAPS schema not found — install with Update-AdmPwdADSchema (from LAPS.x64.msi)'
+        Write-Warn '  Legacy LAPS schema not found - install via Update-AdmPwdADSchema (LAPS.x64.msi)'
         Write-Warn '  Or use Windows LAPS: Update-LapsADSchema'
     }
 
-    # 授予中權限群組讀取 LAPS 密碼（過度授權）
+    # Grant a mid-tier group Extended Rights (includes LAPS password read)
     try {
         $computersOU = "CN=Computers,$Global:DomainDN"
         $mgroup = VulnAD-GetRandom -InputList $Global:MidGroups
         $Src = Get-ADGroup -Identity $mgroup
 
         $ou = [ADSI]("LDAP://$computersOU")
-        # 授予 Extended Right: All Extended Rights (包含 LAPS 讀取)
         $ACE = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
             $Src.SID,
             [System.DirectoryServices.ActiveDirectoryRights]'ExtendedRight',
@@ -834,14 +836,15 @@ function VulnAD-VulnerableLAPS {
 }
 
 # ============================================================
-# 擴增函數 — Legacy 弱設定
+# Extended functions - Legacy weak settings
 # ============================================================
 
 function VulnAD-Pre2kComputer {
     <#
-        對應 Lab：Pre-Windows 2000 Compatible Access
-        Pre2k 機器帳戶的初始密碼 = 電腦名稱小寫（移除 $，最多 14 字元）
-        且從未登入 = 密碼未變更
+        Related labs: Pre-Windows 2000 Compatible Access
+        A pre2k computer account's initial password equals the lowercase
+        computer name (up to 14 chars, stripped of the trailing $), and
+        stays that way if the machine never logs on.
     #>
     Write-Info 'Creating pre-Windows 2000 style computer account with predictable password...'
 
@@ -853,7 +856,7 @@ function VulnAD-Pre2kComputer {
             return
         }
 
-        # 密碼 = 電腦名小寫（不含 $）
+        # Password = lowercase computer name (no $)
         $pwd = $name.ToLower()
         New-ADComputer -Name $name `
             -SamAccountName "$name`$" `
@@ -864,9 +867,9 @@ function VulnAD-Pre2kComputer {
             -Description 'Legacy pre-2000 compatible account' `
             -ErrorAction Stop
 
-        # 設定 UserAccountControl 讓密碼不強制更新
+        # PasswordNotRequired keeps the initial password from being forcibly rotated
         Set-ADAccountControl -Identity "$name`$" -PasswordNotRequired $true
-        Write-Warn "  [Pre2k] $name`$ — password = '$pwd' (predictable, never logged on)"
+        Write-Warn "  [Pre2k] $name`$ - password = '$pwd' (predictable, never logged on)"
     } catch {
         Write-Bad "  Pre2k: $($_.Exception.Message)"
     }
@@ -874,8 +877,9 @@ function VulnAD-Pre2kComputer {
 
 function VulnAD-ReversibleEncryption {
     <#
-        對應 Lab：Reversible Encryption
-        啟用可逆加密的帳戶 → 從 ntds.dit 可取得明文密碼
+        Related labs: Reversible Encryption
+        Accounts with reversible encryption store cleartext-recoverable
+        secrets - dumpable via secretsdump.
     #>
     Write-Info 'Enabling reversible encryption on random accounts...'
     Add-Type -AssemblyName System.Web
@@ -884,21 +888,22 @@ function VulnAD-ReversibleEncryption {
         $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
         $pwd = [System.Web.Security.Membership]::GeneratePassword(14, 3)
         try {
-            # 啟用 AllowReversiblePasswordEncryption
+            # Enable AllowReversiblePasswordEncryption
             Set-ADAccountControl -Identity $u -AllowReversiblePasswordEncryption $true
-            # 密碼必須在旗標啟用後重設，才會被以可逆方式儲存
+            # Password must be RESET after enabling the flag so it's stored reversibly
             Set-ADAccountPassword -Identity $u -Reset `
                 -NewPassword (ConvertTo-SecureString $pwd -AsPlainText -Force)
-            Write-Warn "  [ReversibleEnc] $u — cleartext recoverable via secretsdump"
+            Write-Warn "  [ReversibleEnc] $u - cleartext recoverable via secretsdump"
         } catch {}
     }
 }
 
 function VulnAD-GPPPassword {
     <#
-        對應 Lab：GPP Password (cpassword in SYSVOL)
-        在 SYSVOL 中放置 Groups.xml（有加密的 cpassword）
-        金鑰是公開的 AES 金鑰，可用 gpp-decrypt 解密
+        Related labs: GPP cpassword in SYSVOL
+        The AES key used to encrypt GPP cpassword is publicly known
+        (Microsoft published it), so any authenticated domain user
+        who can read SYSVOL can decrypt these secrets.
     #>
     Write-Info 'Planting GPP cpassword file in SYSVOL...'
 
@@ -908,7 +913,7 @@ function VulnAD-GPPPassword {
         return
     }
 
-    # 選擇一個既有的 GPO 目錄
+    # Pick an existing GPO directory
     $gpoDir = Get-ChildItem $sysvolPath -Directory | Select-Object -First 1
     if (-not $gpoDir) {
         Write-Bad '  No GPO directory found'
@@ -920,8 +925,8 @@ function VulnAD-GPPPassword {
         New-Item -Path $prefsDir -ItemType Directory -Force | Out-Null
     }
 
-    # 這是眾所皆知的 cpassword，明文 "Local*P4ssword!" 用公開 AES 金鑰加密後的結果
-    # 學員會用 gpp-decrypt / Get-GPPPassword 解出
+    # Publicly known cpassword. The AES key is Microsoft-published; any
+    # gpp-decrypt / Get-GPPPassword tool can decode this to the cleartext.
     $cpasswordXml = @'
 <?xml version="1.0" encoding="utf-8"?>
 <Groups clsid="{3125E937-EB16-4b4c-9934-544FC6D24D26}">
@@ -939,24 +944,24 @@ function VulnAD-GPPPassword {
     try {
         $cpasswordXml | Out-File -FilePath $file -Encoding UTF8 -Force
         Write-Warn "  [GPP-cpassword] Groups.xml planted at $file"
-        Write-Warn '  Decrypt with: gpp-decrypt <cpassword> (Kali) or Get-GPPPassword (PowerShell)'
+        Write-Warn '  Decrypt with: gpp-decrypt <cpassword> (Kali) or Get-GPPPassword (PowerSploit)'
     } catch {
         Write-Bad "  GPP: $($_.Exception.Message)"
     }
 }
 
 # ============================================================
-# 擴增函數 — Coercion 前置
+# Extended functions - Coercion preconditions
 # ============================================================
 
 function VulnAD-CoercionServices {
     <#
-        對應 Lab：Coercion 技術棧 (第四冊 CO1)
-        確保以下服務啟用，讓 Coercion 攻擊可用：
-        - Print Spooler (PrinterBug / MS-RPRN)
-        - Encrypting File System (PetitPotam / MS-EFSR)
-        - DFS Namespace (DFSCoerce / MS-DFSNM)
-        - WebClient (WebDAV Coercion) — 通常在工作站上
+        Related labs: Coercion techniques (PrinterBug, PetitPotam, DFSCoerce)
+        Ensure the following services are enabled and running so coercion
+        attacks are available:
+          - Print Spooler  (PrinterBug / MS-RPRN)
+          - Encrypting File System  (PetitPotam / MS-EFSR)
+          - DFS Namespace  (DFSCoerce / MS-DFSNM)
     #>
     Write-Info 'Ensuring coercion-related services are enabled...'
 
@@ -972,21 +977,22 @@ function VulnAD-CoercionServices {
             if ($s) {
                 Set-Service -Name $svc.Name -StartupType Automatic -ErrorAction SilentlyContinue
                 Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
-                Write-Info "  [Coercion] $($svc.Desc) — enabled"
+                Write-Info "  [Coercion] $($svc.Desc) - enabled"
             }
         } catch {}
     }
 }
 
 # ============================================================
-# 擴增函數 — 持久化前置
+# Extended functions - Persistence preconditions
 # ============================================================
 
 function VulnAD-AdminSDHolderBackdoor {
     <#
-        對應 Lab：AdminSDHolder 持久化 (Vol1 題3, Course Part2 Lab18)
-        在 AdminSDHolder 物件上授予一個「無害」使用者 FullControl
-        SDProp 每 60 分鐘會將此 ACE 傳播到所有 Protected 物件（DA、EA 等）
+        Related labs: AdminSDHolder persistence
+        Grant an ordinary user FullControl on AdminSDHolder. SDProp
+        propagates this ACE to all protected objects (DA, EA, etc.)
+        approximately every 60 minutes.
     #>
     Write-Info 'Planting AdminSDHolder backdoor ACE...'
 
@@ -1004,20 +1010,19 @@ function VulnAD-AdminSDHolderBackdoor {
 
 function VulnAD-MultiHopACL {
     <#
-        對應 Lab：多層 ACL 巢狀後門 (第五冊 PE1 技術 4)
-        建立 A → B → C → Domain Admins 的攻擊鏈
-        BloodHound 可以發現，但手動稽核極難察覺
+        Related labs: Multi-hop ACL persistence
+        Build a chain: A -> B -> C -> Domain Admins.
+        Easy for BloodHound to spot, very hard to notice by manual review.
     #>
     Write-Info 'Building multi-hop ACL chain to Domain Admins...'
 
     try {
-        # A、B、C 都是隨機使用者
         $userA = VulnAD-GetRandom -InputList $Global:CreatedUsers
         $userB = VulnAD-GetRandom -InputList $Global:CreatedUsers
         $userC = VulnAD-GetRandom -InputList $Global:CreatedUsers
 
         if ($userA -eq $userB -or $userB -eq $userC -or $userA -eq $userC) {
-            Write-Warn '  Users collision, skipping multi-hop this run'
+            Write-Warn '  User collision detected, skipping multi-hop this run'
             return
         }
 
@@ -1026,21 +1031,21 @@ function VulnAD-MultiHopACL {
         $C = Get-ADUser -Identity $userC
         $DA = Get-ADGroup -Identity 'Domain Admins'
 
-        # A → GenericAll → B
+        # A -> GenericAll -> B
         VulnAD-AddACL -Source $A.SID -Destination $B.DistinguishedName -Rights 'GenericAll' | Out-Null
-        # B → GenericAll → C
+        # B -> GenericAll -> C
         VulnAD-AddACL -Source $B.SID -Destination $C.DistinguishedName -Rights 'GenericAll' | Out-Null
-        # C → WriteDACL → Domain Admins
+        # C -> WriteDACL -> Domain Admins
         VulnAD-AddACL -Source $C.SID -Destination $DA.DistinguishedName -Rights 'WriteDacl' | Out-Null
 
-        Write-Warn "  [MultiHopACL] $userA → $userB → $userC → Domain Admins"
+        Write-Warn "  [MultiHopACL] $userA -> $userB -> $userC -> Domain Admins"
     } catch {
         Write-Bad "  MultiHopACL: $($_.Exception.Message)"
     }
 }
 
 # ============================================================
-# 主函數
+# Main function
 # ============================================================
 
 function Invoke-VulnADExtended {
@@ -1052,7 +1057,7 @@ function Invoke-VulnADExtended {
 
         [int]$UsersLimit = 100,
 
-        # 跳過旗標（讓學員選擇性建置）
+        # Selective skip flags
         [switch]$SkipDelegation,
         [switch]$SkipADCS,
         [switch]$SkipGMSA,
@@ -1076,7 +1081,7 @@ function Invoke-VulnADExtended {
     Write-Info "Domain DN: $Global:DomainDN"
     Write-Info "OS Build: $(VulnAD-GetOSVersion)"
 
-    # 弱化密碼原則
+    # Weaken default password policy
     Write-Info 'Weakening default password policy...'
     Set-ADDefaultDomainPasswordPolicy -Identity $Global:Domain `
         -LockoutDuration 00:01:00 `
@@ -1086,7 +1091,7 @@ function Invoke-VulnADExtended {
         -ReversibleEncryptionEnabled $false `
         -MinPasswordLength 4
 
-    # === 基礎 ===
+    # === Baseline ===
     VulnAD-AddADUser -Limit $UsersLimit
     Write-Good "Created $UsersLimit users"
 
@@ -1119,7 +1124,7 @@ function Invoke-VulnADExtended {
     VulnAD-DCSync
     Write-Good 'DCSync rights granted'
 
-    # === 擴增：委派 ===
+    # === Extended: Delegation ===
     if (-not $SkipDelegation) {
         VulnAD-UnconstrainedDelegation
         VulnAD-ConstrainedDelegation
@@ -1128,30 +1133,30 @@ function Invoke-VulnADExtended {
         Write-Good 'Delegation attack surfaces configured'
     } else { Write-Warn 'Skipped: Delegation' }
 
-    # === 擴增：AD CS ===
+    # === Extended: AD CS ===
     if (-not $SkipADCS) {
         VulnAD-ADCSVulnerable
         Write-Good 'AD CS conditions attempted (see hints for manual steps)'
     } else { Write-Warn 'Skipped: ADCS' }
 
-    # === 擴增：gMSA ===
+    # === Extended: gMSA ===
     if (-not $SkipGMSA) {
         VulnAD-VulnerableGMSA
         Write-Good 'gMSA over-privilege configured'
     } else { Write-Warn 'Skipped: gMSA' }
 
-    # === 擴增：dMSA ===
+    # === Extended: dMSA ===
     if (-not $SkipDMSA) {
         VulnAD-DMSAPrep
     } else { Write-Warn 'Skipped: dMSA' }
 
-    # === 擴增：LAPS ===
+    # === Extended: LAPS ===
     if (-not $SkipLAPS) {
         VulnAD-VulnerableLAPS
         Write-Good 'LAPS over-privilege configured'
     } else { Write-Warn 'Skipped: LAPS' }
 
-    # === 擴增：Legacy ===
+    # === Extended: Legacy ===
     if (-not $SkipLegacy) {
         VulnAD-Pre2kComputer
         VulnAD-ReversibleEncryption
@@ -1159,13 +1164,13 @@ function Invoke-VulnADExtended {
         Write-Good 'Legacy weak configurations planted'
     } else { Write-Warn 'Skipped: Legacy' }
 
-    # === 擴增：Coercion 前置 ===
+    # === Extended: Coercion preconditions ===
     if (-not $SkipCoercion) {
         VulnAD-CoercionServices
         Write-Good 'Coercion services enabled'
     } else { Write-Warn 'Skipped: Coercion' }
 
-    # === 擴增：持久化前置 ===
+    # === Extended: Persistence preconditions ===
     if (-not $SkipPersistence) {
         VulnAD-AdminSDHolderBackdoor
         VulnAD-MultiHopACL
@@ -1178,9 +1183,9 @@ function Invoke-VulnADExtended {
     } else { Write-Warn 'Skipped: SMB Signing' }
 
     Write-Host ''
-    Write-Host '  ╔═══════════════════════════════════════════════════════════╗' -ForegroundColor Green
-    Write-Host '  ║              VulnAD-Extended Build Complete              ║' -ForegroundColor Green
-    Write-Host '  ╚═══════════════════════════════════════════════════════════╝' -ForegroundColor Green
+    Write-Host '  ============================================================' -ForegroundColor Green
+    Write-Host '     VulnAD-Extended build complete' -ForegroundColor Green
+    Write-Host '  ============================================================' -ForegroundColor Green
     Write-Host ''
     Write-Info 'Recommended next steps:'
     Write-Info '  1. Snapshot the DC now (baseline)'
@@ -1193,7 +1198,7 @@ function Invoke-VulnADExtended {
 }
 
 # ============================================================
-# 匯出
+# Module export
 # ============================================================
 
 Export-ModuleMember -Function Invoke-VulnADExtended -ErrorAction SilentlyContinue
