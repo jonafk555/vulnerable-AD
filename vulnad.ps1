@@ -57,6 +57,22 @@
     Author: Extended fork of wazehell/@safe_buffer's VulnAD
     For authorized red-team training and isolated lab environments only.
     NEVER run this on any production network.
+
+    -----------------------------------------------------------------
+    Logic-fix revision. Changes vs. the previous version (behavioural
+    correctness only; no hardening / no new attack surface):
+      1. Password/description-mutating functions now draw from a shared
+         RESERVED pool so they no longer collide or overwrite each
+         other's planted secrets, and never touch svc_* accounts.
+      2. Computer-dependent labs (RBCD / ShadowCred / Unconstrained /
+         gMSA_secure) now self-provision a member computer instead of
+         silently doing nothing on a fresh single-DC lab.
+      3. AddADUser loops until the requested unique count is actually
+         reached and reports the real number created.
+      4. Domain identity is taken from Get-ADDomain (authoritative);
+         -DomainName is validated, not blindly trusted.
+      5. Group membership + several samplers now pick distinct members.
+    -----------------------------------------------------------------
 #>
 
 # ============================================================
@@ -138,10 +154,23 @@ $Global:ServicesAccountsAndSPNs = @(
 )
 
 $Global:CreatedUsers  = @()
+$Global:ReservedUsers = @()   # users already consumed by a password/description-mutating lab
 $Global:AllObjects    = @()
 $Global:Domain        = ''
 $Global:DomainDN      = ''
 $Global:DomainSid     = ''
+
+# Marker written to the 'comment' attribute of every user/computer this tool
+# creates, so Remove-VulnADExtended can find them even in a fresh session
+# (i.e. without relying on the in-memory $Global:CreatedUsers list).
+$Global:VulnADTag = 'VULNAD-EXTENDED'
+
+# Fixed-name objects the builder creates. Used by Remove-VulnADExtended so
+# cleanup does not depend on runtime state.
+$Global:FixedComputers = @('SRV-LEGACY', 'LEGACYPC')
+$Global:FixedGMSAs     = @('gmsa_overshare', 'gmsa_secure')
+$Global:FixedSvcUsers  = @('svc_iis', 'svc_web') + ($Global:ServicesAccountsAndSPNs | ForEach-Object { $_.Name })
+$Global:FixedOUs       = @('ServiceAccountsOU')
 
 # ============================================================
 # Output helpers
@@ -180,6 +209,45 @@ function ShowBanner {
 function VulnAD-GetRandom {
     Param([array]$InputList)
     return Get-Random -InputObject $InputList
+}
+
+# Reserve N distinct human users for a password/description-mutating lab.
+# Excludes svc_* accounts and any user already reserved by another lab, so
+# planted secrets can no longer be silently overwritten by a later function.
+function VulnAD-ReserveUsers {
+    param([int]$Count)
+    $pool = $Global:CreatedUsers | Where-Object {
+        $_ -notmatch '^svc_' -and $Global:ReservedUsers -notcontains $_
+    }
+    if (-not $pool) {
+        Write-Warn '  No unreserved users left - skipping this lab'
+        return @()
+    }
+    $take   = [Math]::Min($Count, @($pool).Count)
+    $picked = @($pool | Get-Random -Count $take)
+    $Global:ReservedUsers += $picked
+    return $picked
+}
+
+# Return an existing enabled non-DC computer, or create a placeholder one.
+# Lets computer-dependent labs work on a fresh single-DC environment instead
+# of silently iterating over an empty set.
+function VulnAD-EnsureMemberComputer {
+    $existing = Get-ADComputer -Filter { PrimaryGroupID -ne 516 } -Properties DNSHostName -ErrorAction SilentlyContinue |
+                Where-Object { $_.Enabled } | Select-Object -First 1
+    if ($existing) { return $existing }
+
+    try {
+        $c = New-ADComputer -Name 'SRV-LEGACY' -SamAccountName 'SRV-LEGACY$' `
+                -Path "CN=Computers,$Global:DomainDN" -Enabled $true `
+                -AccountPassword (ConvertTo-SecureString 'FakeMachinePass2025!' -AsPlainText -Force) `
+                -PassThru -ErrorAction Stop
+        Write-Info '  Created SRV-LEGACY$ placeholder member computer'
+        return $c
+    } catch {
+        Write-Bad "  Could not create placeholder computer: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 function VulnAD-CheckPrerequisites {
@@ -257,29 +325,40 @@ function VulnAD-AddADUser {
     Param([int]$Limit = 1)
     Add-Type -AssemblyName System.Web
 
-    for ($i = 1; $i -le $Limit; $i++) {
+    # Loop until we actually reach the requested number of DISTINCT new users,
+    # rather than burning an iteration on every name collision / create error.
+    $goal  = $Global:CreatedUsers.Count + $Limit
+    $tries = 0
+    $cap   = [Math]::Max($Limit * 20, 50)   # safety valve against infinite loop
+
+    while ($Global:CreatedUsers.Count -lt $goal -and $tries -lt $cap) {
+        $tries++
         $firstname = VulnAD-GetRandom -InputList $Global:HumansNames
         $lastname  = VulnAD-GetRandom -InputList $Global:HumansNames
         $SamAccountName = ("{0}.{1}" -f $firstname, $lastname).ToLower()
 
-        # Skip duplicates
         if ($Global:CreatedUsers -contains $SamAccountName) { continue }
 
         $upn = "$SamAccountName@$Global:Domain"
         $pwd = [System.Web.Security.Membership]::GeneratePassword(14, 3)
 
-        Write-Info "Creating user: $SamAccountName"
         try {
             New-ADUser -Name "$firstname $lastname" `
                 -GivenName $firstname -Surname $lastname `
                 -SamAccountName $SamAccountName `
                 -UserPrincipalName $upn `
                 -AccountPassword (ConvertTo-SecureString $pwd -AsPlainText -Force) `
-                -PassThru -ErrorAction Stop | Enable-ADAccount
+                -OtherAttributes @{ comment = $Global:VulnADTag } `
+                -Enabled $true -ErrorAction Stop
             $Global:CreatedUsers += $SamAccountName
+            Write-Info "Created user: $SamAccountName"
         } catch {
             Write-Bad "Failed to create ${SamAccountName}: $($_.Exception.Message)"
         }
+    }
+
+    if ($tries -ge $cap) {
+        Write-Warn "  Hit attempt cap ($cap) before reaching target; name pool may be too small."
     }
 }
 
@@ -288,11 +367,13 @@ function VulnAD-AddADGroup {
     foreach ($group in $GroupList) {
         Write-Info "Creating group: $group"
         try { New-ADGroup -Name $group -GroupScope Global -ErrorAction Stop } catch {}
-        # Randomly add 3-15 members
+
+        # Add 3-15 DISTINCT members (previous version could pick the same user repeatedly)
         $memberCount = Get-Random -Minimum 3 -Maximum 16
-        for ($i = 1; $i -le $memberCount; $i++) {
-            $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
-            try { Add-ADGroupMember -Identity $group -Members $u -ErrorAction SilentlyContinue } catch {}
+        if (@($Global:CreatedUsers).Count -gt 0) {
+            $take    = [Math]::Min($memberCount, @($Global:CreatedUsers).Count)
+            $members = @($Global:CreatedUsers | Get-Random -Count $take)
+            try { Add-ADGroupMember -Identity $group -Members $members -ErrorAction SilentlyContinue } catch {}
         }
         $Global:AllObjects += $group
     }
@@ -350,7 +431,8 @@ function VulnAD-Kerberoasting {
     Write-Info 'Configuring Kerberoastable service accounts...'
     Add-Type -AssemblyName System.Web
 
-    # Randomly pick one weak-password account from the list
+    # Use the account explicitly flagged Weak (svc_mssql) as the crackable one;
+    # every other service account gets a long random password.
     $weakOne = ($Global:ServicesAccountsAndSPNs | Where-Object { $_.Weak })[0]
 
     foreach ($svc in $Global:ServicesAccountsAndSPNs) {
@@ -371,6 +453,7 @@ function VulnAD-Kerberoasting {
                 -AccountPassword (ConvertTo-SecureString $pwd -AsPlainText -Force) `
                 -Description $svc.Desc `
                 -ServicePrincipalNames @{Add=$spn} `
+                -OtherAttributes @{ comment = $Global:VulnADTag } `
                 -PasswordNeverExpires $true `
                 -Enabled $true `
                 -ErrorAction Stop
@@ -387,26 +470,32 @@ function VulnAD-Kerberoasting {
 function VulnAD-ASREPRoasting {
     Write-Info 'Configuring AS-REP roastable accounts...'
     $count = Get-Random -Minimum 3 -Maximum 7
-    for ($i = 1; $i -le $count; $i++) {
-        $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
+    foreach ($u in (VulnAD-ReserveUsers -Count $count)) {
         $pwd = VulnAD-GetRandom -InputList $Global:BadPasswords
         try {
             Set-ADAccountPassword -Identity $u -Reset -NewPassword (ConvertTo-SecureString $pwd -AsPlainText -Force)
-            Set-ADAccountControl -Identity $u -DoesNotRequirePreAuth $true
+            Set-ADAccountControl  -Identity $u -DoesNotRequirePreAuth $true
             Write-Info "  [ASREP] $u - DoesNotRequirePreAuth + weak password"
-        } catch {}
+        } catch {
+            Write-Bad "  [ASREP] $u : $($_.Exception.Message)"
+        }
     }
 }
 
 function VulnAD-DnsAdmins {
     Write-Info 'Populating DnsAdmins group with abusable members...'
     $count = Get-Random -Minimum 2 -Maximum 6
-    for ($i = 1; $i -le $count; $i++) {
-        $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
-        try {
-            Add-ADGroupMember -Identity 'DnsAdmins' -Members $u -ErrorAction SilentlyContinue
-            Write-Info "  [DnsAdmins] $u"
-        } catch {}
+    # DnsAdmins only ADDS membership (no password/description mutation), so it
+    # may overlap other labs - but pick distinct members within this call.
+    if (@($Global:CreatedUsers).Count -gt 0) {
+        $take    = [Math]::Min($count, @($Global:CreatedUsers).Count)
+        $members = @($Global:CreatedUsers | Get-Random -Count $take)
+        foreach ($u in $members) {
+            try {
+                Add-ADGroupMember -Identity 'DnsAdmins' -Members $u -ErrorAction SilentlyContinue
+                Write-Info "  [DnsAdmins] $u"
+            } catch {}
+        }
     }
     # Nested group: mid-tier group becomes an indirect DnsAdmins member
     $g = VulnAD-GetRandom -InputList $Global:MidGroups
@@ -420,12 +509,10 @@ function VulnAD-PwdInObjectDescription {
     Write-Info 'Planting cleartext passwords in description/info fields...'
     Add-Type -AssemblyName System.Web
     $count = Get-Random -Minimum 4 -Maximum 8
-    for ($i = 1; $i -le $count; $i++) {
-        $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
+    foreach ($u in (VulnAD-ReserveUsers -Count $count)) {
         $pwd = [System.Web.Security.Membership]::GeneratePassword(12, 2)
         try {
             Set-ADAccountPassword -Identity $u -Reset -NewPassword (ConvertTo-SecureString $pwd -AsPlainText -Force)
-            # Use varied phrasing to mimic real-world sloppy admin comments
             $templates = @(
                 "User Password $pwd",
                 "temp pw: $pwd (do not delete)",
@@ -435,21 +522,24 @@ function VulnAD-PwdInObjectDescription {
             $desc = VulnAD-GetRandom -InputList $templates
             Set-ADUser $u -Description $desc
             Write-Info "  [Description-Password] $u"
-        } catch {}
+        } catch {
+            Write-Bad "  [Description-Password] $u : $($_.Exception.Message)"
+        }
     }
 }
 
 function VulnAD-DefaultPassword {
     Write-Info 'Setting default password on onboarding accounts...'
     $count = Get-Random -Minimum 3 -Maximum 6
-    for ($i = 1; $i -le $count; $i++) {
-        $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
+    foreach ($u in (VulnAD-ReserveUsers -Count $count)) {
         try {
             Set-ADAccountPassword -Identity $u -Reset `
                 -NewPassword (ConvertTo-SecureString 'Changeme123!' -AsPlainText -Force)
             Set-ADUser $u -Description 'New user - default password' -ChangePasswordAtLogon $true
             Write-Info "  [DefaultPassword] $u"
-        } catch {}
+        } catch {
+            Write-Bad "  [DefaultPassword] $u : $($_.Exception.Message)"
+        }
     }
 }
 
@@ -457,22 +547,28 @@ function VulnAD-PasswordSpraying {
     Write-Info 'Setting shared password across multiple accounts (spray target)...'
     $shared = 'ncc1701'
     $count = Get-Random -Minimum 8 -Maximum 14
-    for ($i = 1; $i -le $count; $i++) {
-        $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
+    foreach ($u in (VulnAD-ReserveUsers -Count $count)) {
         try {
             Set-ADAccountPassword -Identity $u -Reset `
                 -NewPassword (ConvertTo-SecureString $shared -AsPlainText -Force)
             Set-ADUser $u -Description 'Standard user account'
             Write-Info "  [PasswordSpray] $u <- $shared"
-        } catch {}
+        } catch {
+            Write-Bad "  [Spray] $u : $($_.Exception.Message)"
+        }
     }
 }
 
 function VulnAD-DCSync {
     Write-Info 'Granting DCSync extended rights to random users...'
     $count = Get-Random -Minimum 2 -Maximum 5
-    for ($i = 1; $i -le $count; $i++) {
-        $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
+    # Grants rights only (no password change). Pick DISTINCT users, and record
+    # the marker in 'info' so it does not overwrite planted description secrets.
+    if (@($Global:CreatedUsers).Count -eq 0) { return }
+    $take    = [Math]::Min($count, @($Global:CreatedUsers).Count)
+    $targets = @($Global:CreatedUsers | Get-Random -Count $take)
+
+    foreach ($u in $targets) {
         try {
             $ADObject = [ADSI]("LDAP://$Global:DomainDN")
             $sid = (Get-ADUser -Identity $u).SID
@@ -484,12 +580,14 @@ function VulnAD-DCSync {
             )) {
                 $g = New-Object Guid $guid
                 $ACE = New-Object DirectoryServices.ActiveDirectoryAccessRule($sid,'ExtendedRight','Allow',$g)
-                $ADObject.psbase.Get_objectSecurity().AddAccessRule($ACE)
+                $ADObject.psbase.ObjectSecurity.AddAccessRule($ACE)
             }
             $ADObject.psbase.CommitChanges()
-            Set-ADUser $u -Description 'Replication Account'
+            Set-ADUser $u -Replace @{ info = 'Replication Account' }
             Write-Info "  [DCSync] $u - granted 3 replication extended rights"
-        } catch {}
+        } catch {
+            Write-Bad "  [DCSync] $u : $($_.Exception.Message)"
+        }
     }
 }
 
@@ -509,35 +607,19 @@ function VulnAD-DisableSMBSigning {
 function VulnAD-UnconstrainedDelegation {
     <#
         Related labs: Unconstrained Delegation + Printer Bug
-        Sets TrustedForDelegation on a random member server (or creates
-        a placeholder computer account if none exist).
+        Sets TrustedForDelegation on a member server, self-provisioning one
+        if the lab has no non-DC computers yet.
     #>
     Write-Info 'Configuring Unconstrained Delegation on a member server...'
 
-    # Look for non-DC computer accounts
-    $candidates = Get-ADComputer -Filter { PrimaryGroupID -ne 516 } -Properties DNSHostName |
-                  Where-Object { $_.Enabled }
+    $target = VulnAD-EnsureMemberComputer
+    if (-not $target) { return }
 
-    if ($candidates) {
-        $target = $candidates | Get-Random
-        try {
-            Set-ADComputer -Identity $target -TrustedForDelegation $true
-            Write-Info "  [Unconstrained] $($target.Name)"
-        } catch {
-            Write-Bad "  Failed to set on $($target.Name)"
-        }
-    } else {
-        # No member servers - create a placeholder computer account
-        try {
-            New-ADComputer -Name 'SRV-LEGACY' -SamAccountName 'SRV-LEGACY$' `
-                -Path "CN=Computers,$Global:DomainDN" `
-                -Enabled $true -TrustedForDelegation $true `
-                -AccountPassword (ConvertTo-SecureString 'FakeMachinePass2025!' -AsPlainText -Force) `
-                -ErrorAction Stop
-            Write-Info '  [Unconstrained] Created SRV-LEGACY$ as placeholder'
-        } catch {
-            Write-Bad "  Could not create placeholder: $($_.Exception.Message)"
-        }
+    try {
+        Set-ADComputer -Identity $target.DistinguishedName -TrustedForDelegation $true
+        Write-Info "  [Unconstrained] $($target.Name)"
+    } catch {
+        Write-Bad "  Failed to set on $($target.Name): $($_.Exception.Message)"
     }
 }
 
@@ -560,6 +642,7 @@ function VulnAD-ConstrainedDelegation {
             -Enabled $true -PasswordNeverExpires $true `
             -Description 'IIS App Pool Identity' `
             -ServicePrincipalNames @{Add=@("HTTP/webapp.$Global:Domain")} `
+            -OtherAttributes @{ comment = $Global:VulnADTag } `
             -ErrorAction Stop
 
         $target = "CIFS/$(($env:COMPUTERNAME)).$Global:Domain"
@@ -580,6 +663,7 @@ function VulnAD-ConstrainedDelegation {
             -Enabled $true -PasswordNeverExpires $true `
             -Description 'Web frontend service' `
             -ServicePrincipalNames @{Add=@("HTTP/frontend.$Global:Domain")} `
+            -OtherAttributes @{ comment = $Global:VulnADTag } `
             -ErrorAction Stop
 
         $target = "CIFS/$(($env:COMPUTERNAME)).$Global:Domain"
@@ -613,9 +697,14 @@ function VulnAD-RBCDPrep {
         Write-Bad "  Cannot set MAQ: $($_.Exception.Message)"
     }
 
-    # Grant GenericWrite on up to 5 computer objects to random users
+    # Grant GenericWrite on up to 5 computer objects to random users.
+    # Self-provision a member computer if the lab has none yet.
     try {
-        $computers = Get-ADComputer -Filter { PrimaryGroupID -ne 516 } | Select-Object -First 5
+        $computers = @(Get-ADComputer -Filter { PrimaryGroupID -ne 516 } | Select-Object -First 5)
+        if (-not $computers) {
+            $c = VulnAD-EnsureMemberComputer
+            if ($c) { $computers = @($c) }
+        }
         foreach ($c in $computers) {
             $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
             $Src = Get-ADUser -Identity $u
@@ -634,7 +723,15 @@ function VulnAD-ShadowCredentialsPrep {
     #>
     Write-Info 'Preparing Shadow Credentials attack surface...'
     try {
-        $computers = Get-ADComputer -Filter { PrimaryGroupID -ne 516 } | Get-Random -Count 2
+        $computers = @(Get-ADComputer -Filter { PrimaryGroupID -ne 516 })
+        if (-not $computers) {
+            $c = VulnAD-EnsureMemberComputer
+            if ($c) { $computers = @($c) }
+        }
+        if (-not $computers) { return }
+
+        $take      = [Math]::Min(2, @($computers).Count)
+        $computers = @($computers | Get-Random -Count $take)
         foreach ($c in $computers) {
             $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
             $Src = Get-ADUser -Identity $u
@@ -729,13 +826,15 @@ function VulnAD-VulnerableGMSA {
         Write-Bad "  gmsa_overshare: $($_.Exception.Message)"
     }
 
-    # gMSA 2: securely scoped (control group)
+    # gMSA 2: securely scoped (control group).
+    # Self-provision a member computer so this always has a valid principal.
     try {
         $existing = Get-ADServiceAccount -Filter { Name -eq 'gmsa_secure' } -ErrorAction SilentlyContinue
         if (-not $existing) {
-            # Pick a member server, or fall back to a DC as placeholder
-            $target = (Get-ADComputer -Filter { PrimaryGroupID -ne 516 } | Select-Object -First 1)
-            if (-not $target) { $target = Get-ADComputer -Filter { PrimaryGroupID -eq 516 } | Select-Object -First 1 }
+            $target = VulnAD-EnsureMemberComputer
+            if (-not $target) {
+                $target = Get-ADComputer -Filter { PrimaryGroupID -eq 516 } | Select-Object -First 1
+            }
             New-ADServiceAccount -Name 'gmsa_secure' `
                 -DNSHostName "gmsa_secure.$Global:Domain" `
                 -PrincipalsAllowedToRetrieveManagedPassword "$($target.SamAccountName)" `
@@ -884,8 +983,7 @@ function VulnAD-ReversibleEncryption {
     Write-Info 'Enabling reversible encryption on random accounts...'
     Add-Type -AssemblyName System.Web
     $count = Get-Random -Minimum 2 -Maximum 4
-    for ($i = 1; $i -le $count; $i++) {
-        $u = VulnAD-GetRandom -InputList $Global:CreatedUsers
+    foreach ($u in (VulnAD-ReserveUsers -Count $count)) {
         $pwd = [System.Web.Security.Membership]::GeneratePassword(14, 3)
         try {
             # Enable AllowReversiblePasswordEncryption
@@ -894,7 +992,9 @@ function VulnAD-ReversibleEncryption {
             Set-ADAccountPassword -Identity $u -Reset `
                 -NewPassword (ConvertTo-SecureString $pwd -AsPlainText -Force)
             Write-Warn "  [ReversibleEnc] $u - cleartext recoverable via secretsdump"
-        } catch {}
+        } catch {
+            Write-Bad "  [ReversibleEnc] $u : $($_.Exception.Message)"
+        }
     }
 }
 
@@ -1017,14 +1117,13 @@ function VulnAD-MultiHopACL {
     Write-Info 'Building multi-hop ACL chain to Domain Admins...'
 
     try {
-        $userA = VulnAD-GetRandom -InputList $Global:CreatedUsers
-        $userB = VulnAD-GetRandom -InputList $Global:CreatedUsers
-        $userC = VulnAD-GetRandom -InputList $Global:CreatedUsers
-
-        if ($userA -eq $userB -or $userB -eq $userC -or $userA -eq $userC) {
-            Write-Warn '  User collision detected, skipping multi-hop this run'
+        # Draw three DISTINCT users up front instead of retrying by chance.
+        if (@($Global:CreatedUsers).Count -lt 3) {
+            Write-Warn '  Not enough users for a 3-hop chain, skipping'
             return
         }
+        $picked = @($Global:CreatedUsers | Get-Random -Count 3)
+        $userA, $userB, $userC = $picked
 
         $A = Get-ADUser -Identity $userA
         $B = Get-ADUser -Identity $userB
@@ -1073,13 +1172,32 @@ function Invoke-VulnADExtended {
 
     if (-not (VulnAD-CheckPrerequisites)) { return }
 
-    $Global:Domain    = $DomainName
-    $Global:DomainDN  = (Get-ADDomain).DistinguishedName
-    $Global:DomainSid = (Get-ADDomain).DomainSID.Value
+    # Domain identity is taken from AD itself (authoritative). -DomainName is
+    # only validated so UPNs / SPNs / SYSVOL paths can never point at the wrong domain.
+    $actual = Get-ADDomain
+    if ($DomainName -and $DomainName -ne $actual.DNSRoot) {
+        Write-Warn "Provided -DomainName '$DomainName' does not match actual domain '$($actual.DNSRoot)'."
+        Write-Warn "Using the actual domain '$($actual.DNSRoot)' for all operations."
+    }
+    $Global:Domain        = $actual.DNSRoot
+    $Global:DomainDN      = $actual.DistinguishedName
+    $Global:DomainSid     = $actual.DomainSID.Value
+    $Global:CreatedUsers  = @()
+    $Global:ReservedUsers = @()
+    $Global:AllObjects    = @()
 
     Write-Info "Domain: $Global:Domain"
     Write-Info "Domain DN: $Global:DomainDN"
     Write-Info "OS Build: $(VulnAD-GetOSVersion)"
+
+    # The password/description labs draw distinct users from a shared reserve
+    # pool (~up to ~35 users total). Below this floor the later labs - the
+    # password-spray target in particular - will silently run short of targets.
+    $reserveFloor = 40
+    if ($UsersLimit -lt $reserveFloor) {
+        Write-Warn "UsersLimit=$UsersLimit is low. The reserve pool may be exhausted and later"
+        Write-Warn "  labs (e.g. Password Spraying) will get few or no accounts. Recommend >= $reserveFloor."
+    }
 
     # Weaken default password policy
     Write-Info 'Weakening default password policy...'
@@ -1093,7 +1211,7 @@ function Invoke-VulnADExtended {
 
     # === Baseline ===
     VulnAD-AddADUser -Limit $UsersLimit
-    Write-Good "Created $UsersLimit users"
+    Write-Good "Created $($Global:CreatedUsers.Count) users"
 
     VulnAD-AddADGroup -GroupList $Global:HighGroups
     VulnAD-AddADGroup -GroupList $Global:MidGroups
@@ -1198,7 +1316,199 @@ function Invoke-VulnADExtended {
 }
 
 # ============================================================
+# Cleanup / reset
+# ============================================================
+
+function Remove-VulnADExtended {
+    <#
+    .SYNOPSIS
+        Reverse (as far as practical) what Invoke-VulnADExtended created, so the
+        lab can be rebuilt from a clean state without stacking duplicate ACEs.
+
+    .DESCRIPTION
+        Works without relying on in-memory state: lab users are located by the
+        'comment' = VULNAD-EXTENDED marker, everything else by its fixed name.
+
+        Steps:
+          1. Collect the SIDs of all lab principals (tagged users + fixed-name
+             groups/computers) BEFORE deleting anything.
+          2. Purge every Allow ACE granted to those SIDs from the objects that
+             SURVIVE deletion (domain root, AdminSDHolder, Domain Admins,
+             CN=Computers, and any member computers). ACEs on objects that are
+             themselves deleted disappear automatically.
+          3. Delete lab users, placeholder computers, gMSAs, the builder's
+             groups, and the dMSA OU (recursively).
+          4. Remove the planted GPP Groups.xml from SYSVOL.
+          5. Optionally re-enable SMB signing.
+
+        NOT reverted (stated plainly rather than done blindly):
+          - Domain password policy and ms-DS-MachineAccountQuota: their prior
+            values are unknown, so they are left as-is (warned).
+          - If SDProp already propagated the AdminSDHolder ACE to protected
+            objects (>~60 min after build), those inherited ACEs persist until
+            the next SDProp cycle re-templates them. A DC snapshot revert
+            remains the only guaranteed full reset.
+
+    .EXAMPLE
+        Remove-VulnADExtended -Force
+    #>
+    [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='High')]
+    Param(
+        [switch]$Force,
+        [switch]$ReenableSMBSigning
+    )
+
+    if (-not (VulnAD-CheckPrerequisites)) { return }
+
+    if (-not $Force -and -not $PSCmdlet.ShouldProcess('this domain', 'Remove all VulnAD-Extended lab objects')) {
+        return
+    }
+
+    $actual = Get-ADDomain
+    $Global:Domain   = $actual.DNSRoot
+    $Global:DomainDN = $actual.DistinguishedName
+
+    Write-Info "Cleaning up VulnAD-Extended objects in $Global:Domain ..."
+
+    # --- 1. Collect lab principals and their SIDs (before deletion) ---
+    $labUsers = @()
+    try {
+        $labUsers = @(Get-ADUser -LDAPFilter "(comment=$Global:VulnADTag)" -ErrorAction SilentlyContinue)
+    } catch {}
+    # Fixed-name service users, in case a tag write failed
+    foreach ($n in $Global:FixedSvcUsers) {
+        if ($labUsers.SamAccountName -notcontains $n) {
+            try { $labUsers += Get-ADUser -Identity $n -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+    $labUsers = @($labUsers | Where-Object { $_ } | Sort-Object DistinguishedName -Unique)
+
+    $labGroups = @()
+    foreach ($g in ($Global:HighGroups + $Global:MidGroups + $Global:NormalGroups)) {
+        try { $labGroups += Get-ADGroup -Identity $g -ErrorAction SilentlyContinue } catch {}
+    }
+    $labGroups = @($labGroups | Where-Object { $_ })
+
+    $labComputers = @()
+    foreach ($c in $Global:FixedComputers) {
+        try { $labComputers += Get-ADComputer -Identity $c -ErrorAction SilentlyContinue } catch {}
+    }
+    $labComputers = @($labComputers | Where-Object { $_ })
+
+    # SID set used for ACE purge
+    $labSids = @()
+    foreach ($p in ($labUsers + $labGroups + $labComputers)) {
+        if ($p.SID) { $labSids += $p.SID.Value }
+    }
+    $labSids = @($labSids | Sort-Object -Unique)
+    Write-Info "  Found $($labUsers.Count) users, $($labGroups.Count) groups, $($labComputers.Count) computers to remove"
+
+    # --- 2. Purge ACEs granted to lab SIDs from surviving objects ---
+    $purgeTargets = @(
+        $Global:DomainDN,
+        "CN=AdminSDHolder,CN=System,$Global:DomainDN",
+        "CN=Computers,$Global:DomainDN"
+    )
+    try { $purgeTargets += (Get-ADGroup -Identity 'Domain Admins').DistinguishedName } catch {}
+    # Any real member computers that may carry RBCD/ShadowCred ACEs
+    try {
+        $purgeTargets += (Get-ADComputer -Filter { PrimaryGroupID -ne 516 } -ErrorAction SilentlyContinue |
+                          ForEach-Object { $_.DistinguishedName })
+    } catch {}
+    $purgeTargets = @($purgeTargets | Where-Object { $_ } | Sort-Object -Unique)
+
+    foreach ($t in $purgeTargets) {
+        try {
+            $o = [ADSI]("LDAP://$t")
+            $changed = $false
+            foreach ($sidStr in $labSids) {
+                try {
+                    $sid = New-Object System.Security.Principal.SecurityIdentifier($sidStr)
+                    $o.psbase.ObjectSecurity.PurgeAccessRules($sid)   # removes all ACEs for this SID; no-op if none
+                    $changed = $true
+                } catch {}
+            }
+            if ($changed) { $o.psbase.CommitChanges() }
+        } catch {
+            Write-Bad "  ACE purge failed on ${t}: $($_.Exception.Message)"
+        }
+    }
+    Write-Info '  Purged lab ACEs from surviving objects (domain root, AdminSDHolder, Domain Admins, computers container)'
+
+    # --- 3. Delete lab objects (leaves first) ---
+    foreach ($u in $labUsers) {
+        try { Remove-ADUser -Identity $u.DistinguishedName -Confirm:$false -ErrorAction Stop; Write-Info "  [del] user $($u.SamAccountName)" }
+        catch { Write-Bad "  del user $($u.SamAccountName): $($_.Exception.Message)" }
+    }
+
+    foreach ($c in $labComputers) {
+        try {
+            Set-ADObject -Identity $c.DistinguishedName -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue
+            Remove-ADComputer -Identity $c.DistinguishedName -Confirm:$false -ErrorAction Stop
+            Write-Info "  [del] computer $($c.Name)"
+        } catch { Write-Bad "  del computer $($c.Name): $($_.Exception.Message)" }
+    }
+
+    foreach ($m in $Global:FixedGMSAs) {
+        try {
+            $sa = Get-ADServiceAccount -Identity $m -ErrorAction SilentlyContinue
+            if ($sa) { Remove-ADServiceAccount -Identity $m -Confirm:$false -ErrorAction Stop; Write-Info "  [del] gMSA $m" }
+        } catch { Write-Bad "  del gMSA ${m}: $($_.Exception.Message)" }
+    }
+
+    foreach ($g in $labGroups) {
+        try { Remove-ADGroup -Identity $g.DistinguishedName -Confirm:$false -ErrorAction Stop; Write-Info "  [del] group $($g.Name)" }
+        catch { Write-Bad "  del group $($g.Name): $($_.Exception.Message)" }
+    }
+
+    foreach ($ouName in $Global:FixedOUs) {
+        $ouPath = "OU=$ouName,$Global:DomainDN"
+        try {
+            $ou = Get-ADOrganizationalUnit -Identity $ouPath -ErrorAction SilentlyContinue
+            if ($ou) {
+                Set-ADObject -Identity $ouPath -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue
+                Remove-ADOrganizationalUnit -Identity $ouPath -Recursive -Confirm:$false -ErrorAction Stop
+                Write-Info "  [del] OU $ouName"
+            }
+        } catch { Write-Bad "  del OU ${ouName}: $($_.Exception.Message)" }
+    }
+
+    # --- 4. Remove planted GPP Groups.xml ---
+    try {
+        $policies = "\\$Global:Domain\SYSVOL\$Global:Domain\Policies"
+        if (Test-Path $policies) {
+            Get-ChildItem $policies -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $groupsXml = Join-Path $_.FullName 'Machine\Preferences\Groups\Groups.xml'
+                if (Test-Path $groupsXml) {
+                    $content = Get-Content $groupsXml -Raw -ErrorAction SilentlyContinue
+                    if ($content -match 'LocalAdmin' -and $content -match 'cpassword') {
+                        Remove-Item $groupsXml -Force -ErrorAction SilentlyContinue
+                        Write-Info "  [del] planted GPP Groups.xml in $($_.Name)"
+                    }
+                }
+            }
+        }
+    } catch { Write-Bad "  GPP cleanup: $($_.Exception.Message)" }
+
+    # --- 5. Optional: re-enable SMB signing ---
+    if ($ReenableSMBSigning) {
+        try {
+            Set-SmbClientConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Confirm:$false -Force
+            Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Confirm:$false -Force
+            Write-Info '  Re-enabled SMB signing'
+        } catch { Write-Bad "  SMB signing: $($_.Exception.Message)" }
+    }
+
+    Write-Host ''
+    Write-Good 'VulnAD-Extended cleanup complete'
+    Write-Warn 'NOT reverted automatically:'
+    Write-Warn '  - Domain password policy and ms-DS-MachineAccountQuota (prior values unknown)'
+    Write-Warn '  - Any AdminSDHolder ACE already propagated by SDProp to protected objects'
+    Write-Warn '  For a guaranteed clean baseline, revert the DC snapshot instead.'
+}
+
+# ============================================================
 # Module export
 # ============================================================
 
-Export-ModuleMember -Function Invoke-VulnADExtended -ErrorAction SilentlyContinue
+Export-ModuleMember -Function Invoke-VulnADExtended, Remove-VulnADExtended -ErrorAction SilentlyContinue
